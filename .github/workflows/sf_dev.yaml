@@ -1,0 +1,33 @@
+name: Dev Pipeline
+
+on:
+  pull_request:
+    types: [opened, synchronize, closed]
+    branches: [dev]
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      force_app: ${{ steps.filter.outputs.force_app }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            force_app:
+              - 'force-app/**'
+
+  call-pipeline:
+    needs: changes
+    uses: ./.github/workflows/template.yaml
+    with:
+      environment: dev
+      runner: macos-latest
+      force_app_changed: ${{ needs.changes.outputs.force_app }}
+    secrets: inherit

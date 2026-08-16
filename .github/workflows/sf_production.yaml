@@ -1,0 +1,34 @@
+name: Production Pipeline
+
+on:
+  pull_request:
+    types: [opened, synchronize, closed]
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      force_app: ${{ steps.filter.outputs.force_app }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            force_app:
+              - 'force-app/**'
+
+  call-pipeline:
+    needs: changes
+    uses: ./.github/workflows/template_production.yaml
+    with:
+      environment: production
+      runner: macos-latest
+      force_app_changed: ${{ needs.changes.outputs.force_app }}
+      required_head_branch: staging
+    secrets: inherit

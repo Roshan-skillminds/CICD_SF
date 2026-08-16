@@ -3,7 +3,7 @@ private class HelloWorldServiceTest {
     @IsTest
     static void greetsByName() {
         String result = HelloWorldService.greet('Roshan');
-        System.assertEquals('Hello, Roshan!', result);
+        System.assertEquals('Hello, Roshan!', result );
     }
 
     @IsTest

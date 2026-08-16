@@ -1,0 +1,473 @@
+name: CICD_SF Production Package Pipeline
+
+# Reusable pipeline for staging -> main.
+#
+# CORPNET REQUIREMENT (2026-08-12): production now does a direct delta deploy,
+# same mechanism as dev/staging, instead of building/installing an Unlocked
+# Package version. The original package-based flow (build a package version,
+# install it, auto-rollback to the previously-installed version on failure)
+# is preserved below, commented out, for when package-based delivery comes
+# back into scope - do not delete it, just uncomment when that happens.
+# This direct-deploy flow has NOT been tested end-to-end yet (explicit
+# instruction: build it now, verify later).
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "GitHub Environment name (production)"
+        required: true
+        type: string
+      runner:
+        description: "Runner OS for this job"
+        required: false
+        type: string
+        default: ubuntu-latest
+      force_app_changed:
+        description: "'true' if this PR touches force-app/** - controls whether the real pipeline steps run or are skipped"
+        required: false
+        type: string
+        default: "true"
+      required_head_branch:
+        description: "If set, the PR's source branch must match this exactly or the job fails (enforces the dev -> staging -> main promotion chain)"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      SLACK_WEBHOOK_URL:
+        required: false
+
+jobs:
+  pipeline:
+    name: ${{ inputs.environment }} pipeline
+    runs-on: ${{ inputs.runner }}
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: read
+
+    steps:
+      # ---------------------------------------------------------------
+      # Guard phase - always runs, regardless of force-app changes
+      # ---------------------------------------------------------------
+      - name: Enforce promotion chain
+        if: inputs.required_head_branch != '' && github.head_ref != inputs.required_head_branch
+        run: |
+          echo "::error::${{ inputs.environment }} can only be updated via a PR from the '${{ inputs.required_head_branch }}' branch (got '${{ github.head_ref }}')."
+          exit 1
+
+      # ---------------------------------------------------------------
+      # Setup phase - always runs
+      # ---------------------------------------------------------------
+      - name: Checkout code
+        if: inputs.force_app_changed == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        if: inputs.force_app_changed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ">=24"
+
+      - name: Setup Java
+        if: inputs.force_app_changed == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: ">=11"
+
+      - name: Setup Python
+        if: inputs.force_app_changed == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ">=3.10"
+
+      - name: Read PR body
+        if: inputs.force_app_changed == 'true' && github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: python3 .github/scripts/read_prbody.py
+
+      - name: Install Salesforce CLI
+        if: inputs.force_app_changed == 'true'
+        run: npm install -g @salesforce/cli
+
+      - name: Verify SF CLI version
+        if: inputs.force_app_changed == 'true'
+        run: sf version
+
+      - name: Install SFDX Git Delta plugin
+        if: inputs.force_app_changed == 'true'
+        run: echo y | sf plugins install sfdx-git-delta
+
+      - name: Generate delta
+        if: inputs.force_app_changed == 'true'
+        run: |
+          mkdir -p delta
+          sf sgd source delta \
+            --from "HEAD~1" \
+            --to "HEAD" \
+            --generate-delta \
+            --ignore-file .sgdignore \
+            --output-dir ./delta \
+            --ignore-whitespace \
+            --api-version 66.0 \
+            --source-dir force-app/main/default
+
+          if [ -f delta/package/package.xml ]; then
+            echo "===== package.xml (added / changed) ====="
+            cat delta/package/package.xml
+            echo "=========================================="
+          fi
+
+          echo ""
+          echo "------------------------------------------"
+          echo ""
+
+          if [ -f delta/destructiveChanges/destructiveChanges.xml ]; then
+            echo "destructive_args=--post-destructive-changes delta/destructiveChanges/destructiveChanges.xml" >> "$GITHUB_ENV"
+            echo "===== destructiveChanges.xml (deleted) ====="
+            cat delta/destructiveChanges/destructiveChanges.xml
+            echo "============================================="
+          else
+            echo "destructive_args=" >> "$GITHUB_ENV"
+          fi
+
+      - name: Decrypt JWT key
+        if: inputs.force_app_changed == 'true'
+        run: |
+          openssl enc -nosalt -aes-256-cbc -d \
+            -in "${{ vars.ENCRYPTION_KEY_FILE }}" \
+            -out "${{ vars.JWT_KEY_FILE }}" \
+            -base64 \
+            -K "${{ secrets.DECRYPTION_KEY }}" \
+            -iv "${{ secrets.DECRYPTION_IV }}"
+
+      - name: Authenticate with Salesforce
+        if: inputs.force_app_changed == 'true'
+        env:
+          SF_AUDIENCE_URL: ${{ vars.HUB_LOGIN_URL }}
+        run: |
+          sf org login jwt \
+            --client-id "${{ secrets.CONSUMER_KEY }}" \
+            --jwt-key-file "${{ vars.JWT_KEY_FILE }}" \
+            --username "${{ secrets.DEPLOYMENT_USER_USERNAME }}" \
+            --instance-url "${{ vars.HUB_LOGIN_URL }}" \
+            --alias "${{ vars.ORG_DEFAULT_ALIAS }}" \
+            --set-default
+
+      # ---------------------------------------------------------------
+      # PR phase - opened / synchronize -> validate only (--dry-run)
+      # ---------------------------------------------------------------
+      - name: Validate deploy (dry run)
+        if: inputs.force_app_changed == 'true' && github.event_name == 'pull_request' && github.event.action != 'closed'
+        id: validate
+        run: |
+          set -e
+          if [ -z "$apex_test_classes" ] || [ "$apex_test_classes" == "No Apex classes found" ]; then
+            TEST_LEVEL_ARGS="--test-level RunLocalTests"
+          elif [ "$apex_test_classes" == "RunRelevantTests" ]; then
+            TEST_LEVEL_ARGS="--test-level RunRelevantTests"
+          else
+            TEST_LEVEL_ARGS="--test-level RunSpecifiedTests"
+            IFS=',' read -ra CLASSES <<< "$apex_test_classes"
+            for c in "${CLASSES[@]}"; do
+              TEST_LEVEL_ARGS="$TEST_LEVEL_ARGS --tests $c"
+            done
+          fi
+
+          set +e
+          sf project deploy validate \
+            --manifest delta/package/package.xml \
+            $TEST_LEVEL_ARGS \
+            $destructive_args \
+            --target-org "${{ vars.ORG_DEFAULT_ALIAS }}" \
+            --json > deploy-result.json
+          DEPLOY_EXIT=$?
+
+          echo "----- deploy-result.json -----"
+          cat deploy-result.json
+          echo "-------------------------------"
+
+          if [ $DEPLOY_EXIT -ne 0 ]; then
+            echo "::error::sf project deploy validate failed with exit code $DEPLOY_EXIT (see deploy-result.json above)"
+            exit $DEPLOY_EXIT
+          fi
+
+          JOB_ID=$(python3 -c "import json;print(json.load(open('deploy-result.json'))['result']['id'])")
+          echo "job_id=$JOB_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Enforce code coverage
+        if: inputs.force_app_changed == 'true' && github.event_name == 'pull_request' && github.event.action != 'closed'
+        env:
+          MIN_COVERAGE: "75"
+        run: python3 .github/scripts/code_coverage.py deploy-result.json
+
+      - name: Post validation job ID as PR comment
+        if: inputs.force_app_changed == 'true' && github.event_name == 'pull_request' && github.event.action != 'closed'
+        uses: actions/github-script@v7
+        env:
+          VALIDATION_JOB_ID: ${{ steps.validate.outputs.job_id }}
+        with:
+          script: |
+            const marker = '<!-- sf-validation-id -->';
+            const jobId = process.env.VALIDATION_JOB_ID;
+            const body = `${marker}\nValidation Job ID for this commit: \`${jobId}\``;
+
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            for (const comment of comments.data) {
+              if (comment.body.includes(marker)) {
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: comment.id,
+                });
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      # ---------------------------------------------------------------
+      # Merge phase - PR closed + merged == true -> actual deploy
+      # ---------------------------------------------------------------
+      - name: Read validation job ID from PR comment
+        if: inputs.force_app_changed == 'true' && github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
+        id: read_job_id
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const marker = '<!-- sf-validation-id -->';
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const found = [...comments.data].reverse().find(c => c.body.includes(marker));
+            const match = found ? found.body.match(/`([a-zA-Z0-9]+)`/) : null;
+            core.setOutput('job_id', match ? match[1] : '');
+
+      - name: Quick deploy
+        if: |
+          inputs.force_app_changed == 'true' &&
+          github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true &&
+          steps.read_job_id.outputs.job_id != ''
+        id: quick_deploy
+        continue-on-error: true
+        run: |
+          sf project deploy quick \
+            --job-id "${{ steps.read_job_id.outputs.job_id }}" \
+            --target-org "${{ vars.ORG_DEFAULT_ALIAS }}"
+
+      - name: Fallback full deploy
+        if: |
+          inputs.force_app_changed == 'true' &&
+          github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true &&
+          (steps.read_job_id.outputs.job_id == '' || steps.quick_deploy.outcome == 'failure')
+        run: |
+          TEST_LEVEL_ARGS="--test-level RunLocalTests"
+          if [ "$apex_test_classes" == "RunRelevantTests" ]; then
+            TEST_LEVEL_ARGS="--test-level RunRelevantTests"
+          elif [ -n "$apex_test_classes" ] && [ "$apex_test_classes" != "No Apex classes found" ]; then
+            TEST_LEVEL_ARGS="--test-level RunSpecifiedTests"
+            IFS=',' read -ra CLASSES <<< "$apex_test_classes"
+            for c in "${CLASSES[@]}"; do
+              TEST_LEVEL_ARGS="$TEST_LEVEL_ARGS --tests $c"
+            done
+          fi
+
+          sf project deploy start \
+            --manifest delta/package/package.xml \
+            $TEST_LEVEL_ARGS \
+            $destructive_args \
+            --target-org "${{ vars.ORG_DEFAULT_ALIAS }}"
+
+      # ---------------------------------------------------------------
+      # DISABLED (corpnet requirement, 2026-08-12): package-based deploy.
+      # Kept here commented out for when package-based delivery returns -
+      # uncomment this block and remove the direct-deploy steps above
+      # (Install SFDX Git Delta plugin / Generate delta / Validate deploy /
+      # Enforce code coverage / Post validation comment / Read validation
+      # job ID / Quick deploy / Fallback full deploy) to switch back.
+      # ---------------------------------------------------------------
+      # - name: Query currently installed package version
+      #   if: |
+      #     inputs.force_app_changed == 'true' &&
+      #     github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
+      #   id: current_version
+      #   run: |
+      #     sf package installed list --target-org "${{ vars.ORG_DEFAULT_ALIAS }}" --json > installed-list.json
+      #     cat installed-list.json
+      #
+      #     CURRENT_ID=$(python3 -c "
+      #     import json
+      #     with open('installed-list.json') as f:
+      #         data = json.load(f)
+      #     for pkg in data.get('result', []):
+      #         if pkg.get('SubscriberPackageName') == 'CICD_SF_CI':
+      #             print(pkg.get('SubscriberPackageVersionId', ''))
+      #             break
+      #     ")
+      #     echo "current_version_id=$CURRENT_ID" >> "$GITHUB_OUTPUT"
+      #     if [ -z "$CURRENT_ID" ]; then
+      #       echo "No CICD_SF_CI package currently installed - this will be the first install, no rollback target exists."
+      #     else
+      #       echo "Currently installed CICD_SF_CI version: $CURRENT_ID"
+      #     fi
+      #
+      # - name: Create new package version
+      #   if: |
+      #     inputs.force_app_changed == 'true' &&
+      #     github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
+      #   id: new_version
+      #   run: |
+      #     set +e
+      #     sf package version create \
+      #       --package CICD_SF_CI \
+      #       --path force-app \
+      #       --installation-key-bypass \
+      #       --code-coverage \
+      #       --wait 30 \
+      #       --target-dev-hub "${{ vars.ORG_DEFAULT_ALIAS }}" \
+      #       --json > version-create-result.json
+      #     CREATE_EXIT=$?
+      #
+      #     echo "----- version-create-result.json -----"
+      #     cat version-create-result.json
+      #     echo "---------------------------------------"
+      #
+      #     if [ $CREATE_EXIT -ne 0 ]; then
+      #       echo "::error::Package version creation failed with exit code $CREATE_EXIT (see version-create-result.json above)"
+      #       exit $CREATE_EXIT
+      #     fi
+      #
+      #     NEW_VERSION_ID=$(python3 -c "
+      #     import json
+      #     with open('version-create-result.json') as f:
+      #         data = json.load(f)
+      #     print(data['result'].get('SubscriberPackageVersionId', ''))
+      #     ")
+      #     NEW_VERSION_NUMBER=$(python3 -c "
+      #     import json
+      #     with open('version-create-result.json') as f:
+      #         data = json.load(f)
+      #     print(data['result'].get('VersionNumber', ''))
+      #     ")
+      #     echo "new_version_id=$NEW_VERSION_ID" >> "$GITHUB_OUTPUT"
+      #     echo "new_version_number=$NEW_VERSION_NUMBER" >> "$GITHUB_OUTPUT"
+      #     echo "New package version created: $NEW_VERSION_ID ($NEW_VERSION_NUMBER)"
+      #
+      # - name: Promote package version to Released
+      #   if: |
+      #     inputs.force_app_changed == 'true' &&
+      #     github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
+      #   run: |
+      #     set +e
+      #     sf package version promote \
+      #       --package "${{ steps.new_version.outputs.new_version_id }}" \
+      #       --target-dev-hub "${{ vars.ORG_DEFAULT_ALIAS }}" \
+      #       --no-prompt \
+      #       --json > promote-result.json
+      #     PROMOTE_EXIT=$?
+      #
+      #     echo "----- promote-result.json -----"
+      #     cat promote-result.json
+      #     echo "-------------------------------"
+      #
+      #     if [ $PROMOTE_EXIT -ne 0 ]; then
+      #       echo "::error::Promoting version to Released failed with exit code $PROMOTE_EXIT (see promote-result.json above). A production org can only install a Released version - this must succeed before install can proceed."
+      #       exit $PROMOTE_EXIT
+      #     fi
+      #
+      # - name: Install new package version
+      #   if: |
+      #     inputs.force_app_changed == 'true' &&
+      #     github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
+      #   id: install
+      #   continue-on-error: true
+      #   run: |
+      #     sf package install \
+      #       --package "${{ steps.new_version.outputs.new_version_id }}" \
+      #       --target-org "${{ vars.ORG_DEFAULT_ALIAS }}" \
+      #       --wait 15 \
+      #       --no-prompt
+      #
+      # - name: Rollback to previous version on install failure
+      #   if: |
+      #     inputs.force_app_changed == 'true' &&
+      #     github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true &&
+      #     steps.install.outcome == 'failure' && steps.current_version.outputs.current_version_id != ''
+      #   run: |
+      #     echo "::error::Install of ${{ steps.new_version.outputs.new_version_id }} failed. Rolling back to previous version ${{ steps.current_version.outputs.current_version_id }}."
+      #     sf package install \
+      #       --package "${{ steps.current_version.outputs.current_version_id }}" \
+      #       --target-org "${{ vars.ORG_DEFAULT_ALIAS }}" \
+      #       --wait 15 \
+      #       --no-prompt
+      #     echo "::error::Rollback completed. Production is running the previous version, NOT the just-merged change. Investigate the failed install before retrying."
+      #
+      # - name: Warn if install failed with no rollback target
+      #   if: |
+      #     inputs.force_app_changed == 'true' &&
+      #     github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true &&
+      #     steps.install.outcome == 'failure' && steps.current_version.outputs.current_version_id == ''
+      #   run: |
+      #     echo "::error::Install failed AND there is no previously-installed version to roll back to (this was the first install). Production has NO CICD_SF_CI package installed. Manual investigation required."
+      #
+      # - name: Fail job if install ultimately failed
+      #   if: |
+      #     inputs.force_app_changed == 'true' &&
+      #     github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true &&
+      #     steps.install.outcome == 'failure'
+      #   run: exit 1
+      #
+      # - name: Create GitHub Release (audit trail only, not used for rollback)
+      #   if: |
+      #     inputs.force_app_changed == 'true' &&
+      #     github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true &&
+      #     steps.install.outcome == 'success'
+      #   env:
+      #     GH_TOKEN: ${{ github.token }}
+      #   run: |
+      #     gh release create "pkg-${{ steps.new_version.outputs.new_version_number }}-${{ github.run_id }}" \
+      #       --title "CICD_SF_CI ${{ steps.new_version.outputs.new_version_number }}" \
+      #       --notes "Package version ID: ${{ steps.new_version.outputs.new_version_id }}
+      #       Installed into: ${{ vars.ORG_DEFAULT_ALIAS }}
+      #       Merged PR: #${{ github.event.pull_request.number }}
+      #       Previous version: ${{ steps.current_version.outputs.current_version_id || 'none (first install)' }}"
+
+      - name: No force-app changes
+        if: inputs.force_app_changed != 'true'
+        run: echo "No force-app/** changes detected - skipping the full pipeline. Nothing to validate or deploy."
+
+      # ---------------------------------------------------------------
+      # Notify phase - always runs
+      # ---------------------------------------------------------------
+      - name: Notify Slack
+        if: always() && (inputs.force_app_changed == 'true' || job.status != 'success')
+        run: |
+          if [ -z "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            echo "No SLACK_WEBHOOK_URL configured, skipping notification."
+            exit 0
+          fi
+
+          STATUS_EMOJI="✅"
+          if [ "${{ job.status }}" != "success" ]; then
+            STATUS_EMOJI="❌"
+          fi
+
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\": \"$STATUS_EMOJI *${{ github.workflow }}* on *${{ github.repository }}* (${{ github.ref_name }}) by ${{ github.actor }} - event: ${{ github.event_name }} - ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"

@@ -3,7 +3,7 @@ private class CiTriggerCheckTest {
     @isTest
     static void testPing() {
 
-        System.assertEquals('pong v9', CiTriggerCheck.ping());
+        System.assertEquals('pong v10', CiTriggerCheck.ping());
 
     }
 }

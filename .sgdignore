@@ -1,0 +1,9 @@
+# Ignore file for sfdx-git-delta (used by the CI/CD pipeline's "Generate delta" step)
+# Patterns here are excluded from the generated delta package, same idea as .forceignore.
+
+# LWC configuration files
+**/jsconfig.json
+**/.eslintrc.json
+
+# LWC Jest
+**/__tests__/**

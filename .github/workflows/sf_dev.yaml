@@ -28,6 +28,6 @@ jobs:
     uses: ./.github/workflows/template.yaml
     with:
       environment: dev
-      runner: macos-latest
+      runner: ubuntu-latest
       force_app_changed: ${{ needs.changes.outputs.force_app }}
     secrets: inherit

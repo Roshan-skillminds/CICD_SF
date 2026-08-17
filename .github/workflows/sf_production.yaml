@@ -28,7 +28,7 @@ jobs:
     uses: ./.github/workflows/template_production.yaml
     with:
       environment: production
-      runner: macos-latest
+      runner: ubuntu-latest
       force_app_changed: ${{ needs.changes.outputs.force_app }}
       required_head_branch: staging
     secrets: inherit
